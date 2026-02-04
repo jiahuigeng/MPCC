@@ -4,6 +4,14 @@ import json
 import time
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any, Union
+import numpy as np
+import torch
+import torchvision.transforms as T
+from PIL import Image
+from torchvision.transforms.functional import InterpolationMode
+from transformers import AutoModel, AutoTokenizer
+import librosa
+from transformers.processing_utils import ProcessorMixin
 
 # Try to import api_sources for keys
 try:
@@ -250,77 +258,162 @@ class LocalHuggingFaceLLM(BaseLLM):
         return f"Response from {self.model_name} (Simulation): processed {prompt}, img={len(images or [])}, audio={bool(audio)}"
 
 
+class WhisperProcessor(ProcessorMixin):
+    attributes = ["feature_extractor"]
+    feature_extractor_class = "WhisperFeatureExtractor"
+    def __init__(self, feature_extractor):
+        super().__init__(feature_extractor)
+        self.current_processor = self.feature_extractor
+        self._in_target_context_manager = False
+
+    def get_decoder_prompt_ids(self, task=None, language=None, no_timestamps=True):
+        return self.tokenizer.get_decoder_prompt_ids(task=task, language=language, no_timestamps=no_timestamps)
+
+    def get_T_after_cnn(self,L_in, dilation=1):
+        for (padding, kernel_size, stride) in eval("[(1,3,1)] + [(1,3,2)] "):
+            L_out = L_in + 2 * padding - dilation * (kernel_size - 1) - 1
+            L_out = 1 + L_out // stride
+            L_in = L_out
+        return L_out
+
+    def __call__(self, *args, **kwargs):
+        if self._in_target_context_manager:
+            return self.current_processor(*args, **kwargs)
+
+        audio = kwargs.pop("audio", None)
+        sampling_rate = kwargs.pop("sampling_rate", 16000)
+        text = kwargs.pop("text", None)
+        if len(args) > 0:
+            audio = args[0]
+            args = args[1:]
+
+        if audio is None and text is None:
+            raise ValueError("You need to specify either an `audio` or `text` input to process.")
+
+        if audio is not None:
+            L = (audio.shape[0] if audio.shape[0] <= 480000 else 480000)  # max_length < 30s
+            mel_len = L // 160
+            audio_len_after_cnn = self.get_T_after_cnn(mel_len)
+            audio_token_num = (audio_len_after_cnn - 2) // 2 + 1
+            inputs = self.feature_extractor(audio, *args, sampling_rate=sampling_rate, **kwargs)
+            inputs['audio_len_after_cnn'] = torch.tensor(audio_len_after_cnn, dtype=torch.long)
+            inputs['audio_token_num'] = torch.tensor(audio_token_num, dtype=torch.long)
+        if text is not None:
+            encodings = self.tokenizer(text, **kwargs)
+
+        if text is None:
+            return inputs
+
+        elif audio is None:
+            return encodings
+        else:
+            inputs["labels"] = encodings["input_ids"]
+            return inputs
+
+    def batch_decode(self, *args, **kwargs):
+        return self.tokenizer.batch_decode(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        return self.tokenizer.decode(*args, **kwargs)
+
+    def get_prompt_ids(self, text: str, return_tensors="np"):
+        return self.tokenizer.get_prompt_ids(text, return_tensors=return_tensors)
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+def build_transform(input_size):
+    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+    transform = T.Compose([
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=MEAN, std=STD)
+    ])
+    return transform
+
+def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    best_ratio_diff = float('inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    # calculate the existing image aspect ratio
+    target_ratios = set(
+        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+        i * j <= max_num and i * j >= min_num)
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # find the closest aspect ratio to the target
+    target_aspect_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+    # calculate the target width and height
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # resize the image
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size
+        )
+        # split the image
+        split_img = resized_img.crop(box)
+        processed_images.append(split_img)
+    assert len(processed_images) == blocks
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+    return processed_images
+
+def load_image(image_file, input_size=448, max_num=12):
+    image = Image.open(image_file).convert('RGB')
+    transform = build_transform(input_size=input_size)
+    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+    pixel_values = [transform(image) for image in images]
+    pixel_values = torch.stack(pixel_values)
+    return pixel_values
+
+def load_audio(audio_file, audio_processor):
+    audio_values, _ = librosa.load(audio_file, sr=16000) # sample rate should be 16000
+    
+    audio_process_values = audio_processor(audio_values, sampling_rate=16000, return_tensors="pt")
+    input_features = audio_process_values['input_features']
+    audio_len_after_cnn = audio_process_values['audio_len_after_cnn']
+    audio_token_num = audio_process_values['audio_token_num']
+                
+
+    audio_input = {'audio_values': input_features, 
+                   'audio_len_after_cnn': audio_len_after_cnn, 
+                   'audio_token_num': audio_token_num, 
+                   } 
+    return audio_input
+
+
 class InternOmniLLM(LocalHuggingFaceLLM):
     def __init__(self, model_name: str = "InternOmni"):
         super().__init__(model_name, hf_path="OpenGVLab/InternOmni")
         self.image_size = 448
-
-    def build_transform(self, input_size):
-        import torchvision.transforms as T
-        from torchvision.transforms.functional import InterpolationMode
-        IMAGENET_MEAN = (0.485, 0.456, 0.406)
-        IMAGENET_STD = (0.229, 0.224, 0.225)
-        
-        transform = T.Compose([
-            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-        ])
-        return transform
-
-    def dynamic_preprocess(self, image, min_num=1, max_num=6, image_size=448, use_thumbnail=True):
-        from PIL import Image
-        import math
-        
-        orig_width, orig_height = image.size
-        aspect_ratio = orig_width / orig_height
-
-        # Calculate the optimal number of blocks
-        target_ratios = set(
-            (i, j) for n in range(min_num, max_num + 1)
-            for i in range(1, n + 1) for j in range(1, n + 1) if i * j <= max_num and i * j >= min_num
-        )
-        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
-
-        # Find the best aspect ratio
-        best_ratio_diff = float('inf')
-        best_ratio = (1, 1)
-        area = orig_width * orig_height
-        for ratio in target_ratios:
-            target_aspect_ratio = ratio[0] / ratio[1]
-            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
-            if ratio_diff < best_ratio_diff:
-                best_ratio_diff = ratio_diff
-                best_ratio = ratio
-            elif ratio_diff == best_ratio_diff:
-                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
-                    best_ratio = ratio
-
-        # Resize the image
-        target_width = image_size * best_ratio[0]
-        target_height = image_size * best_ratio[1]
-        blocks = best_ratio[0] * best_ratio[1]
-
-        resized_img = image.resize((target_width, target_height), Image.LANCZOS)
-        
-        processed_images = []
-        for i in range(blocks):
-            box = (
-                (i % best_ratio[0]) * image_size,
-                (i // best_ratio[0]) * image_size,
-                ((i % best_ratio[0]) + 1) * image_size,
-                ((i // best_ratio[0]) + 1) * image_size
-            )
-            # split the image
-            split_img = resized_img.crop(box)
-            processed_images.append(split_img)
-
-        if use_thumbnail and blocks > 1:
-            thumbnail_img = image.resize((image_size, image_size), Image.LANCZOS)
-            processed_images.append(thumbnail_img)
-            
-        return processed_images
+        self.max_num = 12
 
     def load_model(self):
         if self.model is None:
@@ -350,20 +443,20 @@ class InternOmniLLM(LocalHuggingFaceLLM):
                     transformers.onnx = dummy_onnx
 
                 import torch
-                from transformers import AutoModel, AutoTokenizer, WhisperProcessor
+                from transformers import AutoModel, AutoTokenizer
                 
-                self.tokenizer = AutoTokenizer.from_pretrained(self.hf_path, trust_remote_code=True)
+                self.tokenizer = AutoTokenizer.from_pretrained(self.hf_path, trust_remote_code=True, use_fast=False)
                 # InternOmni usually requires float16/bfloat16
                 self.model = AutoModel.from_pretrained(
                     self.hf_path, 
                     trust_remote_code=True, 
                     torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
                     device_map="auto"
-                )
-                self.model.eval()
+                ).eval()
                 
                 # Audio processor
-                self.audio_processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
+                self.audio_processor = WhisperProcessor.from_pretrained(self.hf_path)
                 
             except Exception as e:
                 import traceback
@@ -377,58 +470,56 @@ class InternOmniLLM(LocalHuggingFaceLLM):
 
         try:
             import torch
-            from PIL import Image
             
             # Prepare Image
             pixel_values = None
             if images and len(images) > 0:
-                image = Image.open(images[0]).convert('RGB')
-                transform = self.build_transform(input_size=self.image_size)
-                images_list = self.dynamic_preprocess(image, image_size=self.image_size, use_thumbnail=True, max_num=6)
-                pixel_values = [transform(img) for img in images_list]
-                pixel_values = torch.stack(pixel_values).to(torch.bfloat16).cuda()
+                # Use load_image helper
+                pixel_values = load_image(images[0], input_size=self.image_size, max_num=self.max_num)
+                pixel_values = pixel_values.to(torch.bfloat16).cuda()
             
             # Prepare Audio
-            audio_values = None
-            audio_len = None
+            audio_input = None
             if audio:
-                import librosa
-                # Load audio
-                y, sr = librosa.load(audio, sr=16000)
-                audio_inputs = self.audio_processor(y, sampling_rate=sr, return_tensors="pt")
-                audio_values = audio_inputs.input_features.to(torch.bfloat16).cuda()
-                audio_len = torch.tensor([audio_values.shape[1]], dtype=torch.long).to(self.model.device)
+                # Use load_audio helper
+                audio_input = load_audio(audio, self.audio_processor)
+                # Move tensors to cuda
+                if isinstance(audio_input, dict):
+                    if 'audio_values' in audio_input:
+                        audio_input['audio_values'] = audio_input['audio_values'].to(torch.bfloat16).cuda()
+                    if 'audio_len_after_cnn' in audio_input:
+                        audio_input['audio_len_after_cnn'] = audio_input['audio_len_after_cnn'].to(self.model.device)
+                    if 'audio_token_num' in audio_input:
+                        audio_input['audio_token_num'] = audio_input['audio_token_num'].to(self.model.device)
 
             generation_config = dict(
                 max_new_tokens=1024,
                 do_sample=True,
-                temperature=0.7,
-                top_p=0.95,
+                # temperature=0.7,
+                # top_p=0.95,
             )
             
             # Construct input logic based on available modalities
-            # Note: InternOmni usage might vary, assuming it supports a chat method or similar interaction
-            if hasattr(self.model, 'chat'):
-                 # Prepare kwargs
-                 kwargs = {}
-                 if pixel_values is not None:
-                     kwargs['pixel_values'] = pixel_values
-                 if audio_values is not None:
-                     kwargs['audio_values'] = audio_values
-                     if audio_len is not None:
-                         kwargs['audio_len'] = audio_len
+            if hasattr(self.model, 'Audio_chat'):
+                 # model.Audio_chat(tokenizer=tokenizer, pixel_values=pixel_values, audio=audio, question=None, generation_config)
+                 # Note: User example passes question=None when audio is present (ASR task).
+                 # But if we want to ask a question about image/audio, we should pass prompt.
+                 # User example: question = '请将这段语音识别成文字...' then passed question=None in the line:
+                 # response = model.Audio_chat(..., question=None, generation_config)
+                 # Wait, user commented out the question line. Maybe for ASR it's None.
+                 # But for general chat, we should pass the prompt.
+                 # Let's pass the prompt.
                  
-                 response, _ = self.model.chat(
-                     self.tokenizer, 
-                     question=prompt, 
-                     generation_config=generation_config,
-                     **kwargs
+                 response = self.model.Audio_chat(
+                     tokenizer=self.tokenizer, 
+                     pixel_values=pixel_values,
+                     audio=audio_input, 
+                     question=prompt if prompt else None, 
+                     generation_config=generation_config
                  )
                  return response
             else:
-                 # If no chat method, we might need manual construction.
-                 # For now, let's assume chat exists as it's common in InternVL/Omni
-                 return "Error: model.chat method not found."
+                 return "Error: model.Audio_chat method not found."
 
         except Exception as e:
             import traceback

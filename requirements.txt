@@ -1,0 +1,10 @@
+openai
+google-generativeai
+dashscope
+transformers
+torch
+pillow
+pandas
+pyarrow
+openpyxl
+huggingface_hub

@@ -290,7 +290,52 @@ def get_model(model_name: str) -> BaseLLM:
 # Test Block
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Example usage
-    # model = get_model("gpt-4o-mini")
-    # print(model.generate("Hello!"))
-    pass
+    # Test all models
+    test_models = [
+        "gpt-4o-mini",
+        "gemini-2.0-flash-exp",
+        "qwen-omni-turbo",
+        "InternOmni",
+        "Ming-Omni",
+        "M2-omni"
+    ]
+    
+    image_url = "https://llava-vl.github.io/static/images/view.jpg"
+    prompt_text = "Please describe the image."
+    
+    # Download image temporarily for testing
+    import requests
+    from PIL import Image
+    from io import BytesIO
+    
+    local_image_path = "test_view.jpg"
+    print(f"Downloading test image from {image_url}...")
+    try:
+        response = requests.get(image_url)
+        if response.status_code == 200:
+            with open(local_image_path, "wb") as f:
+                f.write(response.content)
+            print(f"Saved to {local_image_path}")
+        else:
+            print(f"Failed to download image: {response.status_code}")
+            local_image_path = None
+    except Exception as e:
+        print(f"Error downloading image: {e}")
+        local_image_path = None
+
+    if local_image_path:
+        for model_name in test_models:
+            print(f"\n--- Testing Model: {model_name} ---")
+            try:
+                model = get_model(model_name)
+                # Pass list of images as expected by signature
+                response = model.generate(prompt=prompt_text, images=[local_image_path])
+                print(f"Response:\n{response}")
+            except Exception as e:
+                print(f"Error testing {model_name}: {e}")
+        
+        # Cleanup
+        # if os.path.exists(local_image_path):
+        #    os.remove(local_image_path)
+    else:
+        print("Skipping tests because image could not be downloaded.")

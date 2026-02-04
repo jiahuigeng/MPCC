@@ -265,7 +265,31 @@ class M2OmniLLM(LocalHuggingFaceLLM):
 
 class Qwen25OmniLLM(LocalHuggingFaceLLM):
     def __init__(self, model_name: str = "Qwen/Qwen2.5-Omni-7B"):
-        super().__init__(model_name, hf_path="Qwen/Qwen2.5-Omni-7B", model_class_name="AutoModelForCausalLM")
+        super().__init__(model_name, hf_path="Qwen/Qwen2.5-Omni-7B", model_class_name="Qwen2_5OmniForConditionalGeneration")
+        self.use_audio_in_video = True # Default setting from example
+
+    def load_model(self):
+        # Lazy loading
+        if self.model is None:
+            print(f"Loading {self.model_name} from {self.hf_path}...")
+            try:
+                from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+                
+                # Load model
+                self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+                    self.hf_path, 
+                    torch_dtype="auto", 
+                    device_map="auto"
+                )
+                
+                # Load processor
+                self.processor = Qwen2_5OmniProcessor.from_pretrained(self.hf_path)
+                
+            except ImportError:
+                print("Error: transformers/torch or qwen_omni_utils not installed.")
+                print("Please install: pip install transformers qwen-omni-utils")
+            except Exception as e:
+                print(f"Error loading model: {e}")
 
     def generate(self, prompt: str, images: Optional[List[str]] = None, audio: Optional[str] = None) -> str:
         self.load_model()
@@ -273,44 +297,82 @@ class Qwen25OmniLLM(LocalHuggingFaceLLM):
             return "Error: Model not loaded."
 
         try:
+            from qwen_omni_utils import process_mm_info
+            
             # Construct conversation
             content = []
+            
+            # Handle images/videos
+            # Note: The example treated video input specifically. 
+            # We will treat 'images' list as images unless they look like video files, 
+            # but for MPCC task they are likely images.
             if images:
                 for img in images:
-                    content.append({"type": "image", "image": img})
+                    # Simple heuristic: if extension is mp4/avi/mov, treat as video
+                    if img.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                        content.append({"type": "video", "video": img})
+                    else:
+                        content.append({"type": "image", "image": img})
+            
+            # Handle audio
             if audio:
+                 # Qwen2.5-Omni supports audio input? Example shows output audio generation.
+                 # But let's assume standard Qwen multimodal format if supported.
+                 # The user example shows video input. 
+                 # If audio input is supported, it usually follows "audio" type.
+                 # However, qwen-omni-utils process_mm_info handles 'audio', 'image', 'video'.
                  content.append({"type": "audio", "audio": audio})
             
             content.append({"type": "text", "text": prompt})
             
-            conversations = [
+            conversation = [
                 {
                     "role": "user",
                     "content": content
                 }
             ]
             
-            # Apply chat template
-            inputs = self.processor.apply_chat_template(
-                conversations,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt"
-            ).to(self.model.device)
+            # Preparation for inference
+            text = self.processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
             
-            # Generate
-            output_ids = self.model.generate(**inputs, max_new_tokens=256)
+            # Process multimodal info
+            # qwen_omni_utils.process_mm_info is key here
+            audios, images_processed, videos = process_mm_info(conversation, use_audio_in_video=self.use_audio_in_video)
             
-            # Decode - Extract only the new tokens
-            generated_ids = [
-                output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)
-            ]
-            response_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            # Create inputs
+            inputs = self.processor(
+                text=text, 
+                audio=audios, 
+                images=images_processed, 
+                videos=videos, 
+                return_tensors="pt", 
+                padding=True, 
+                use_audio_in_video=self.use_audio_in_video
+            )
+            
+            inputs = inputs.to(self.model.device).to(self.model.dtype)
+            
+            # Inference: Generation of the output text and audio
+            # We prioritize text output for this task
+            output = self.model.generate(**inputs, use_audio_in_video=self.use_audio_in_video)
+            
+            # The model returns (text_ids, audio_values) tuple if generating both?
+            # The example shows: text_ids, audio = model.generate(...)
+            # Let's handle the return value carefully.
+            
+            if isinstance(output, tuple):
+                 text_ids = output[0]
+                 # audio_out = output[1] 
+            else:
+                 text_ids = output
+            
+            response_text = self.processor.batch_decode(text_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
             
             return response_text
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return f"Error during generation: {e}"
 
 # -----------------------------------------------------------------------------

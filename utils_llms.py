@@ -326,6 +326,29 @@ class InternOmniLLM(LocalHuggingFaceLLM):
         if self.model is None:
             print(f"Loading {self.model_name} from {self.hf_path}...")
             try:
+                # Patch for missing transformers.onnx in newer transformers versions (e.g. 5.0.0)
+                # OpenGVLab/InternOmni remote code depends on it
+                import sys
+                import types
+                try:
+                    import transformers.onnx
+                except ImportError:
+                    print("Patching missing transformers.onnx for InternOmni...")
+                    dummy_onnx = types.ModuleType("transformers.onnx")
+                    
+                    class MockOnnxConfig:
+                        def __init__(self, *args, **kwargs): pass
+                    
+                    class MockOnnxSeq2SeqConfigWithPast:
+                        def __init__(self, *args, **kwargs): pass
+                        
+                    dummy_onnx.OnnxConfig = MockOnnxConfig
+                    dummy_onnx.OnnxSeq2SeqConfigWithPast = MockOnnxSeq2SeqConfigWithPast
+                    
+                    sys.modules["transformers.onnx"] = dummy_onnx
+                    import transformers
+                    transformers.onnx = dummy_onnx
+
                 import torch
                 from transformers import AutoModel, AutoTokenizer, WhisperProcessor
                 

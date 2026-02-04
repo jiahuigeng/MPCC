@@ -280,11 +280,24 @@ class Qwen25OmniLLM(LocalHuggingFaceLLM):
                 
                 # Patch for 'pad_token_id' missing in TalkerConfig
                 if hasattr(config, 'talker_config') and config.talker_config is not None:
+                    # Check vocab_size of talker_config
+                    talker_vocab_size = getattr(config.talker_config, 'vocab_size', 4096)
+                    
                     if not hasattr(config.talker_config, 'pad_token_id') or config.talker_config.pad_token_id is None:
-                        # Use main config's pad_token_id or default
-                        pad_token = getattr(config, 'pad_token_id', 151643) 
+                        # Use a safe default (e.g., 0 or size-1) instead of main model's 151643
+                        # Because Talker has much smaller vocab size (e.g. 4096 or 8192)
+                        pad_token = 0 
+                        if talker_vocab_size > 0:
+                             pad_token = talker_vocab_size - 1
+                             
                         setattr(config.talker_config, 'pad_token_id', pad_token)
-                        print(f"Patched talker_config with pad_token_id={pad_token}")
+                        print(f"Patched talker_config with pad_token_id={pad_token} (vocab_size={talker_vocab_size})")
+                    else:
+                        # Even if it exists, check if it's valid
+                         current_pad = config.talker_config.pad_token_id
+                         if current_pad >= talker_vocab_size:
+                             print(f"Fixing invalid pad_token_id {current_pad} for talker vocab {talker_vocab_size}")
+                             config.talker_config.pad_token_id = talker_vocab_size - 1
 
                 # Load model
                 self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(

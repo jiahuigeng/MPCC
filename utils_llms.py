@@ -257,6 +257,10 @@ class M2OmniLLM(LocalHuggingFaceLLM):
     def __init__(self, model_name: str = "M2-omni"):
         super().__init__(model_name, hf_path="M2-omni/M2-omni") # Hypothetical path
 
+class Qwen25OmniLLM(LocalHuggingFaceLLM):
+    def __init__(self, model_name: str = "Qwen/Qwen2.5-Omni-7B"):
+        super().__init__(model_name, hf_path="Qwen/Qwen2.5-Omni-7B")
+
 # -----------------------------------------------------------------------------
 # Factory
 # -----------------------------------------------------------------------------
@@ -271,6 +275,8 @@ def get_model(model_name: str) -> BaseLLM:
         return GeminiLLM(model_name)
     
     if "qwen" in name_lower and "omni" in name_lower:
+        if "2.5" in name_lower or "huggingface" in name_lower:
+             return Qwen25OmniLLM(model_name)
         return QwenOmniLLM(model_name)
     
     if "intern" in name_lower and "omni" in name_lower:
@@ -295,6 +301,7 @@ if __name__ == "__main__":
         "gpt-4o-mini",
         "gemini-2.0-flash-exp",
         "qwen-omni-turbo",
+        "Qwen/Qwen2.5-Omni-7B",
         "InternOmni",
         "Ming-Omni",
         "M2-omni"

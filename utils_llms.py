@@ -209,9 +209,10 @@ class QwenOmniLLM(BaseLLM):
 
 class LocalHuggingFaceLLM(BaseLLM):
     """Base class for local transformers-based Omni models."""
-    def __init__(self, model_name: str, hf_path: str):
+    def __init__(self, model_name: str, hf_path: str, model_class_name: str = "AutoModel"):
         super().__init__(model_name)
         self.hf_path = hf_path
+        self.model_class_name = model_class_name
         self.model = None
         self.tokenizer = None
         self.processor = None
@@ -221,9 +222,14 @@ class LocalHuggingFaceLLM(BaseLLM):
         if self.model is None:
             print(f"Loading {self.model_name} from {self.hf_path}...")
             try:
-                from transformers import AutoModel, AutoTokenizer, AutoProcessor
+                from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+                
+                loader = AutoModel
+                if self.model_class_name == "AutoModelForCausalLM":
+                    loader = AutoModelForCausalLM
+                
                 # This is generic; specific models might need specific classes
-                self.model = AutoModel.from_pretrained(self.hf_path, trust_remote_code=True, device_map="auto")
+                self.model = loader.from_pretrained(self.hf_path, trust_remote_code=True, device_map="auto")
                 self.tokenizer = AutoTokenizer.from_pretrained(self.hf_path, trust_remote_code=True)
                 try:
                     self.processor = AutoProcessor.from_pretrained(self.hf_path, trust_remote_code=True)
@@ -259,7 +265,53 @@ class M2OmniLLM(LocalHuggingFaceLLM):
 
 class Qwen25OmniLLM(LocalHuggingFaceLLM):
     def __init__(self, model_name: str = "Qwen/Qwen2.5-Omni-7B"):
-        super().__init__(model_name, hf_path="Qwen/Qwen2.5-Omni-7B")
+        super().__init__(model_name, hf_path="Qwen/Qwen2.5-Omni-7B", model_class_name="AutoModelForCausalLM")
+
+    def generate(self, prompt: str, images: Optional[List[str]] = None, audio: Optional[str] = None) -> str:
+        self.load_model()
+        if not self.model:
+            return "Error: Model not loaded."
+
+        try:
+            # Construct conversation
+            content = []
+            if images:
+                for img in images:
+                    content.append({"type": "image", "image": img})
+            if audio:
+                 content.append({"type": "audio", "audio": audio})
+            
+            content.append({"type": "text", "text": prompt})
+            
+            conversations = [
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ]
+            
+            # Apply chat template
+            inputs = self.processor.apply_chat_template(
+                conversations,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt"
+            ).to(self.model.device)
+            
+            # Generate
+            output_ids = self.model.generate(**inputs, max_new_tokens=256)
+            
+            # Decode - Extract only the new tokens
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)
+            ]
+            response_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            
+            return response_text
+
+        except Exception as e:
+            return f"Error during generation: {e}"
 
 # -----------------------------------------------------------------------------
 # Factory

@@ -440,7 +440,10 @@ class InternOmniLLM(LocalHuggingFaceLLM):
                     
                     sys.modules["transformers.onnx"] = dummy_onnx
                     import transformers
-                    transformers.onnx = dummy_onnx
+                # Suppress logging to avoid "KeyError: 'architectures'" in InternOmni config __repr__
+                # which is triggered by logger.info(f"Model config {config}") in AutoConfig.from_pretrained
+                # due to a bug in the remote code's config class default initialization
+                transformers.logging.set_verbosity_error()
 
                 import torch
                 from transformers import AutoModel, AutoTokenizer

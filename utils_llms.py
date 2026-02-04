@@ -276,6 +276,19 @@ class Qwen25OmniLLM(LocalHuggingFaceLLM):
                 from transformers import AutoConfig, Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, BitsAndBytesConfig
                 import torch
 
+                # Patch for missing set_submodule in Qwen2_5OmniForConditionalGeneration
+                # This is required for bitsandbytes quantization on some custom models or torch versions
+                if not hasattr(Qwen2_5OmniForConditionalGeneration, 'set_submodule'):
+                    print("Patching set_submodule for Qwen2_5OmniForConditionalGeneration")
+                    def set_submodule(self, target, module):
+                        atoms = target.split(".")
+                        name = atoms.pop()
+                        mod = self
+                        for item in atoms:
+                            mod = getattr(mod, item)
+                        setattr(mod, name, module)
+                    Qwen2_5OmniForConditionalGeneration.set_submodule = set_submodule
+
                 print(f"Loading {self.model_name} with 4-bit quantization...")
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,

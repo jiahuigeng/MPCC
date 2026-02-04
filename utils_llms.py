@@ -252,8 +252,165 @@ class LocalHuggingFaceLLM(BaseLLM):
 
 class InternOmniLLM(LocalHuggingFaceLLM):
     def __init__(self, model_name: str = "InternOmni"):
-        # Assuming generic path or user provides it
-        super().__init__(model_name, hf_path="OpenGVLab/InternOmni") # Hypothetical path
+        super().__init__(model_name, hf_path="OpenGVLab/InternOmni")
+        self.image_size = 448
+
+    def build_transform(self, input_size):
+        import torchvision.transforms as T
+        from torchvision.transforms.functional import InterpolationMode
+        IMAGENET_MEAN = (0.485, 0.456, 0.406)
+        IMAGENET_STD = (0.229, 0.224, 0.225)
+        
+        transform = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        ])
+        return transform
+
+    def dynamic_preprocess(self, image, min_num=1, max_num=6, image_size=448, use_thumbnail=True):
+        from PIL import Image
+        import math
+        
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+
+        # Calculate the optimal number of blocks
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1)
+            for i in range(1, n + 1) for j in range(1, n + 1) if i * j <= max_num and i * j >= min_num
+        )
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+        # Find the best aspect ratio
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = orig_width * orig_height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+
+        # Resize the image
+        target_width = image_size * best_ratio[0]
+        target_height = image_size * best_ratio[1]
+        blocks = best_ratio[0] * best_ratio[1]
+
+        resized_img = image.resize((target_width, target_height), Image.LANCZOS)
+        
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % best_ratio[0]) * image_size,
+                (i // best_ratio[0]) * image_size,
+                ((i % best_ratio[0]) + 1) * image_size,
+                ((i // best_ratio[0]) + 1) * image_size
+            )
+            # split the image
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+
+        if use_thumbnail and blocks > 1:
+            thumbnail_img = image.resize((image_size, image_size), Image.LANCZOS)
+            processed_images.append(thumbnail_img)
+            
+        return processed_images
+
+    def load_model(self):
+        if self.model is None:
+            print(f"Loading {self.model_name} from {self.hf_path}...")
+            try:
+                import torch
+                from transformers import AutoModel, AutoTokenizer, WhisperProcessor
+                
+                self.tokenizer = AutoTokenizer.from_pretrained(self.hf_path, trust_remote_code=True)
+                # InternOmni usually requires float16/bfloat16
+                self.model = AutoModel.from_pretrained(
+                    self.hf_path, 
+                    trust_remote_code=True, 
+                    torch_dtype=torch.bfloat16,
+                    device_map="auto"
+                )
+                self.model.eval()
+                
+                # Audio processor
+                self.audio_processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
+                
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"Error loading InternOmni: {e}")
+
+    def generate(self, prompt: str, images: Optional[List[str]] = None, audio: Optional[str] = None) -> str:
+        self.load_model()
+        if not self.model:
+            return "Error: Model not loaded."
+
+        try:
+            import torch
+            from PIL import Image
+            
+            # Prepare Image
+            pixel_values = None
+            if images and len(images) > 0:
+                image = Image.open(images[0]).convert('RGB')
+                transform = self.build_transform(input_size=self.image_size)
+                images_list = self.dynamic_preprocess(image, image_size=self.image_size, use_thumbnail=True, max_num=6)
+                pixel_values = [transform(img) for img in images_list]
+                pixel_values = torch.stack(pixel_values).to(torch.bfloat16).cuda()
+            
+            # Prepare Audio
+            audio_values = None
+            audio_len = None
+            if audio:
+                import librosa
+                # Load audio
+                y, sr = librosa.load(audio, sr=16000)
+                audio_inputs = self.audio_processor(y, sampling_rate=sr, return_tensors="pt")
+                audio_values = audio_inputs.input_features.to(torch.bfloat16).cuda()
+                audio_len = torch.tensor([audio_values.shape[1]], dtype=torch.long).to(self.model.device)
+
+            generation_config = dict(
+                max_new_tokens=1024,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.95,
+            )
+            
+            # Construct input logic based on available modalities
+            # Note: InternOmni usage might vary, assuming it supports a chat method or similar interaction
+            if hasattr(self.model, 'chat'):
+                 # Prepare kwargs
+                 kwargs = {}
+                 if pixel_values is not None:
+                     kwargs['pixel_values'] = pixel_values
+                 if audio_values is not None:
+                     kwargs['audio_values'] = audio_values
+                     if audio_len is not None:
+                         kwargs['audio_len'] = audio_len
+                 
+                 response, _ = self.model.chat(
+                     self.tokenizer, 
+                     question=prompt, 
+                     generation_config=generation_config,
+                     **kwargs
+                 )
+                 return response
+            else:
+                 # If no chat method, we might need manual construction.
+                 # For now, let's assume chat exists as it's common in InternVL/Omni
+                 return "Error: model.chat method not found."
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"Error: {e}"
 
 class MingOmniLLM(LocalHuggingFaceLLM):
     def __init__(self, model_name: str = "Ming-Omni"):
@@ -462,10 +619,9 @@ def get_model(model_name: str) -> BaseLLM:
 if __name__ == "__main__":
     # Test all models
     test_models = [
-        "gpt-4o-mini",
-        "gemini-2.0-flash-exp",
-        "qwen-omni-turbo",
-        "Qwen/Qwen2.5-Omni-7B",
+        # "gpt-4o-mini",
+        # "gemini-2.0-flash-exp",
+        # "Qwen/Qwen2.5-Omni-7B",
         "InternOmni",
         "Ming-Omni",
         "M2-omni"

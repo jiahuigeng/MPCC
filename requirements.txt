@@ -10,4 +10,6 @@ openpyxl
 huggingface_hub
 qwen-omni-utils
 bitsandbytes
+librosa
+torchvision
 accelerate

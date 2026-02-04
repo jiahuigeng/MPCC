@@ -8,3 +8,4 @@ pandas
 pyarrow
 openpyxl
 huggingface_hub
+qwen-omni-utils

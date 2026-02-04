@@ -273,22 +273,37 @@ class Qwen25OmniLLM(LocalHuggingFaceLLM):
         if self.model is None:
             print(f"Loading {self.model_name} from {self.hf_path}...")
             try:
-                from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+                from transformers import AutoConfig, Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
                 
+                # Load config first to patch potential issues
+                config = AutoConfig.from_pretrained(self.hf_path, trust_remote_code=True)
+                
+                # Patch for 'pad_token_id' missing in TalkerConfig
+                if hasattr(config, 'talker_config') and config.talker_config is not None:
+                    if not hasattr(config.talker_config, 'pad_token_id') or config.talker_config.pad_token_id is None:
+                        # Use main config's pad_token_id or default
+                        pad_token = getattr(config, 'pad_token_id', 151643) 
+                        setattr(config.talker_config, 'pad_token_id', pad_token)
+                        print(f"Patched talker_config with pad_token_id={pad_token}")
+
                 # Load model
                 self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
                     self.hf_path, 
+                    config=config,
                     torch_dtype="auto", 
-                    device_map="auto"
+                    device_map="auto",
+                    trust_remote_code=True
                 )
                 
                 # Load processor
-                self.processor = Qwen2_5OmniProcessor.from_pretrained(self.hf_path)
+                self.processor = Qwen2_5OmniProcessor.from_pretrained(self.hf_path, trust_remote_code=True)
                 
             except ImportError:
                 print("Error: transformers/torch or qwen_omni_utils not installed.")
                 print("Please install: pip install transformers qwen-omni-utils")
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"Error loading model: {e}")
 
     def generate(self, prompt: str, images: Optional[List[str]] = None, audio: Optional[str] = None) -> str:

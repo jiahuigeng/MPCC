@@ -273,8 +273,16 @@ class Qwen25OmniLLM(LocalHuggingFaceLLM):
         if self.model is None:
             print(f"Loading {self.model_name} from {self.hf_path}...")
             try:
-                from transformers import AutoConfig, Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
-                
+                from transformers import AutoConfig, Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, BitsAndBytesConfig
+                import torch
+
+                print(f"Loading {self.model_name} with 4-bit quantization...")
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4"
+                )
+
                 # Load config first to patch potential issues
                 config = AutoConfig.from_pretrained(self.hf_path, trust_remote_code=True)
                 
@@ -303,17 +311,18 @@ class Qwen25OmniLLM(LocalHuggingFaceLLM):
                 self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
                     self.hf_path, 
                     config=config,
-                    torch_dtype="auto", 
+                    quantization_config=quantization_config,
                     device_map="auto",
-                    trust_remote_code=True
+                    trust_remote_code=True,
+                    use_safetensors=True  # Force safetensors to bypass torch.load vulnerability check
                 )
                 
                 # Load processor
                 self.processor = Qwen2_5OmniProcessor.from_pretrained(self.hf_path, trust_remote_code=True)
                 
             except ImportError:
-                print("Error: transformers/torch or qwen_omni_utils not installed.")
-                print("Please install: pip install transformers qwen-omni-utils")
+                print("Error: transformers, torch, bitsandbytes or qwen_omni_utils not installed.")
+                print("Please install: pip install transformers qwen-omni-utils bitsandbytes accelerate")
             except Exception as e:
                 import traceback
                 traceback.print_exc()

@@ -9,3 +9,5 @@ pyarrow
 openpyxl
 huggingface_hub
 qwen-omni-utils
+bitsandbytes
+accelerate

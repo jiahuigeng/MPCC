@@ -13,16 +13,26 @@ from transformers import AutoModel, AutoTokenizer
 import librosa
 from transformers.processing_utils import ProcessorMixin
 
-# Try to import api_sources for keys
+# Try to import api_sources or api_resources for keys
 try:
     import api_sources
 except ImportError:
     api_sources = None
 
-def get_key(name: str) -> Optional[str]:
-    """Helper to get API key from api_sources.py or environment variable."""
+try:
+    import api_resources
+except ImportError:
+    api_resources = None
+
+def get_key(name: str) -> Optional[Union[str, List[str]]]:
+    """Helper to get API key from api_sources/api_resources or environment variable."""
+    # Check api_resources first (user preference)
+    if api_resources and hasattr(api_resources, name):
+        return getattr(api_resources, name)
+    # Check api_sources
     if api_sources and hasattr(api_sources, name):
         return getattr(api_sources, name)
+    
     return os.environ.get(name)
 
 # -----------------------------------------------------------------------------
@@ -34,14 +44,18 @@ class BaseLLM(ABC):
         self.model_name = model_name
 
     @abstractmethod
-    def generate(self, prompt: str, images: Optional[List[str]] = None, audio: Optional[str] = None) -> str:
+    def generate(self, prompt: str, images: Optional[List[Union[str, bytes]]] = None, audio: Optional[str] = None, flag: str = "text") -> str:
         """
         Generate response from the model.
         
         Args:
             prompt (str): The text prompt.
-            images (List[str], optional): List of image paths.
+            images (List[Union[str, bytes]], optional): List of image paths or image bytes.
             audio (str, optional): Path to the audio file.
+            flag (str, optional): Mode flag. 
+                - "text": Text + Image (standard VQA).
+                - "spoken": Audio + Image (Multimodal interaction).
+                - "asr": ASR -> Text -> LLM (Pipeline: Audio to Text, then Text+Image to LLM).
             
         Returns:
             str: The generated text response.
@@ -49,7 +63,7 @@ class BaseLLM(ABC):
         pass
 
 # -----------------------------------------------------------------------------
-# OpenAI Wrapper (GPT-4o-mini)
+# OpenAI Wrapper (GPT-4o-mini / GPT-4o)
 # -----------------------------------------------------------------------------
 
 class OpenAILLM(BaseLLM):
@@ -64,33 +78,116 @@ class OpenAILLM(BaseLLM):
         except ImportError:
             raise ImportError("Please install openai: pip install openai")
 
-    def _encode_image(self, image_path: str) -> str:
-        with open(image_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
+    def _encode_image(self, image_input: Union[str, bytes]) -> str:
+        if isinstance(image_input, str):
+            with open(image_input, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+        elif isinstance(image_input, bytes):
+            return base64.b64encode(image_input).decode("utf-8")
+        else:
+            raise ValueError(f"Unsupported image input type: {type(image_input)}")
 
-    def generate(self, prompt: str, images: Optional[List[str]] = None, audio: Optional[str] = None) -> str:
-        if audio:
-            print(f"WARNING: Model {self.model_name} does not natively support audio input via this wrapper. Audio ignored.")
-            # Note: GPT-4o-audio-preview supports audio, but gpt-4o-mini is text/image.
+    def generate(self, prompt: str, images: Optional[List[Union[str, bytes]]] = None, audio: Optional[str] = None, flag: str = "text") -> str:
+        # 1. Handle "asr" flag: Explicitly pipeline Audio -> Text -> Vision
+        if flag == "asr" and audio:
+            print(f"Info: OpenAI [ASR Mode] - Transcribing audio first...")
+            try:
+                # Step 1: Transcribe
+                audio_instruction = self._process_audio_instruction(audio)
+                print(f"  -> Transcribed Audio: '{audio_instruction}'")
+                
+                # Step 2: Update prompt
+                prompt = f"{prompt}\n\n[Audio Transcript]: {audio_instruction}"
+                
+                # Step 3: Clear audio so we don't send it to the model again
+                audio = None
+                
+                # Continue to standard processing (Text + Image)
+                # Ensure we use a vision-capable model if the current one is audio-only
+                if "audio" in self.model_name:
+                    # Temporary switch for the vision part if the user selected an audio model
+                    # But ideally, 'asr' mode implies using a text/vision model for the second step.
+                    pass
+            except Exception as e:
+                return f"Error in ASR step: {e}"
+
+        # 2. Handle "spoken" flag: Attempt native Audio support
+        # Note: OpenAI does not support Audio + Image in one call (REST API).
+        if flag == "spoken":
+            if images and audio:
+                print("Warning: OpenAI does not support native Audio + Image in one request.")
+                # We will proceed to try sending both, but it will likely fail or require the model to be audio-only (no images)
+                # or vision-only (no audio).
+                # However, to be helpful, if the user insists on 'spoken' with OpenAI, we might fallback to the pipeline
+                # OR we just let the API error out/warn to show capability limits.
+                # Given previous context, let's allow it to proceed so the user sees the result (or lack thereof).
+                pass
         
         messages = []
-        content = [{"type": "text", "text": prompt}]
+        content = []
+        if prompt:
+            content.append({"type": "text", "text": prompt})
 
+        # Handle Images
         if images:
-            for img_path in images:
-                base64_image = self._encode_image(img_path)
+            # Check for OpenAI models that don't support images
+            # If we are in 'spoken' mode with an audio model, this might fail.
+            # If we are in 'asr' mode, we already cleared audio, so we should be fine assuming we pick a vision model.
+            
+            override_model = None
+            if "audio-preview" in self.model_name:
+                 if flag == "asr" or flag == "text":
+                     # If we are doing ASR (converted to text) or Text mode, we MUST use a vision model
+                     print("  -> Switching to 'gpt-4o' for Image processing (Audio model doesn't support images)...")
+                     override_model = "gpt-4o"
+                 elif flag == "spoken":
+                     # In spoken mode, the user *wants* to test the audio model.
+                     # But audio-preview doesn't support images. 
+                     # We will warn and skip images? Or let it fail?
+                     # Let's warn.
+                     print("  -> Warning: 'gpt-4o-audio-preview' does not support input images. Images might be ignored or cause error.")
+            
+            for img in images:
+                base64_image = self._encode_image(img)
                 content.append({
                     "type": "image_url",
                     "image_url": {
                         "url": f"data:image/jpeg;base64,{base64_image}"
                     }
                 })
+        else:
+            override_model = None
+        
+        # Handle Audio (Native)
+        if audio and flag == "spoken":
+            # Only send audio payload if flag is 'spoken' (or if we didn't clear it in ASR mode)
+            try:
+                with open(audio, "rb") as f:
+                    audio_bytes = f.read()
+                base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+                content.append({
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": base64_audio,
+                        "format": "wav"
+                    }
+                })
+            except Exception as e:
+                print(f"Error processing audio for OpenAI: {e}")
         
         messages.append({"role": "user", "content": content})
 
         try:
+            # Use override_model if set, otherwise self.model_name
+            model_to_use = override_model if override_model else self.model_name
+            
+            # Final check
+            if audio and "gpt-4o" in model_to_use and "audio" not in model_to_use:
+                 if flag == "spoken":
+                     return "Error: 'gpt-4o' (Text/Vision) does not support Audio input. Use 'gpt-4o-audio-preview' or flag='asr'."
+            
             response = self.client.chat.completions.create(
-                model=self.model_name,
+                model=model_to_use,
                 messages=messages,
                 max_tokens=4096
             )
@@ -98,64 +195,135 @@ class OpenAILLM(BaseLLM):
         except Exception as e:
             return f"Error: {e}"
 
+    def _process_audio_instruction(self, audio_path: str) -> str:
+        """Helper to transcribe/extract instruction from audio using OpenAI Whisper (whisper-1)."""
+        try:
+            with open(audio_path, "rb") as audio_file:
+                # Use Whisper-1 for accurate ASR
+                transcription = self.client.audio.transcriptions.create(
+                    model="whisper-1", 
+                    file=audio_file
+                )
+            return transcription.text
+        except Exception as e:
+            raise RuntimeError(f"Failed to process audio instruction: {e}")
+
 # -----------------------------------------------------------------------------
 # Gemini Wrapper (Gemini 2.0)
 # -----------------------------------------------------------------------------
 
 class GeminiLLM(BaseLLM):
-    def __init__(self, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, model_name: str = "gemini-2.0-flash"):
         super().__init__(model_name)
+        self.use_new_sdk = False
+        self.client = None
+        self.model = None
+
+        # API Key
+        self.api_key = get_key("GOOGLE_API_KEY") or get_key("GEMINI_API_KEY") or get_key("GEMINI_API_KEYS")
+        
+        # Handle list of keys (random selection)
+        if isinstance(self.api_key, list):
+            import random
+            self.api_key = random.choice(self.api_key)
+            
+        if not self.api_key:
+            raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY(S) not found.")
+
+        # Try new SDK first: google-genai
         try:
-            import google.generativeai as genai
-            api_key = get_key("GOOGLE_API_KEY")
-            if not api_key:
-                # Try to look for GEMINI_API_KEY as well
-                api_key = get_key("GEMINI_API_KEY")
-            
-            if not api_key:
-                raise ValueError("GOOGLE_API_KEY not found.")
-            
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(model_name)
+            from google import genai
+            self.client = genai.Client(api_key=self.api_key)
+            self.use_new_sdk = True
+            print("Using google-genai SDK (v2).")
         except ImportError:
-            raise ImportError("Please install google-generativeai: pip install google-generativeai")
-
-    def generate(self, prompt: str, images: Optional[List[str]] = None, audio: Optional[str] = None) -> str:
-        import google.generativeai as genai
-        from PIL import Image
-
-        parts = [prompt]
-
-        if images:
-            for img_path in images:
-                try:
-                    parts.append(Image.open(img_path))
-                except Exception as e:
-                    print(f"Error loading image {img_path}: {e}")
-
-        if audio:
-            # For Gemini, we usually upload the file using the File API for large files,
-            # or pass data if small. Here we assume we might need to upload.
-            # Simplified approach: Upload to File API (requires internet)
+            # Fallback to old SDK: google-generativeai
             try:
-                # Check if file exists
-                if os.path.exists(audio):
-                    # Note: In a real script, we should cache uploads or handle cleanup.
-                    # Here we upload every time for simplicity, or check if it's already a File object.
-                    print(f"Uploading audio {audio} to Gemini...")
-                    audio_file = genai.upload_file(path=audio)
-                    # Wait for processing if needed (video usually needs it, audio is fast)
-                    parts.append(audio_file)
-                else:
-                    print(f"Audio file not found: {audio}")
-            except Exception as e:
-                print(f"Error handling audio: {e}")
+                import google.generativeai as genai_old
+                genai_old.configure(api_key=self.api_key)
+                self.model = genai_old.GenerativeModel(model_name)
+                print("Using google-generativeai SDK (legacy).")
+            except ImportError:
+                raise ImportError("Please install google-genai or google-generativeai.")
 
-        try:
-            response = self.model.generate_content(parts)
-            return response.text
-        except Exception as e:
-            return f"Error: {e}"
+    def generate(self, prompt: str, images: Optional[List[Union[str, bytes]]] = None, audio: Optional[str] = None, flag: str = "text") -> str:
+        parts = []
+        
+        # 1. Handle "asr" flag for Gemini: Simulate Pipeline (Transcribe -> Text+Image)
+        if flag == "asr" and audio:
+            print("Info: Gemini [ASR Mode] - Transcribing audio first...")
+            try:
+                # Transcribe using Gemini itself (audio only)
+                transcription = self.generate(prompt="Please transcribe this audio exactly.", audio=audio, flag="spoken") 
+                # Note: recursive call with 'spoken' and no images to get transcript
+                print(f"  -> Transcribed Audio: '{transcription}'")
+                
+                prompt = f"{prompt}\n\n[Audio Transcript]: {transcription}"
+                audio = None # Clear audio for the main call
+            except Exception as e:
+                return f"Error in Gemini ASR step: {e}"
+        
+        parts.append(prompt)
+        
+        # Load Images
+        if images:
+            from PIL import Image
+            import io
+            for img_input in images:
+                try:
+                    if isinstance(img_input, str):
+                        parts.append(Image.open(img_input))
+                    elif isinstance(img_input, bytes):
+                        parts.append(Image.open(io.BytesIO(img_input)))
+                    elif isinstance(img_input, Image.Image):
+                        parts.append(img_input)
+                    else:
+                        print(f"Warning: Unsupported image input type {type(img_input)}")
+                except Exception as e:
+                    print(f"Error loading image {img_input if isinstance(img_input, str) else 'bytes'}: {e}")
+
+        # New SDK Implementation
+        if self.use_new_sdk:
+            from google.genai import types
+            
+            # Handle Audio for new SDK
+            if audio and flag == "spoken":
+                try:
+                    with open(audio, "rb") as f:
+                        audio_bytes = f.read()
+                    parts.append(types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"))
+                except Exception as e:
+                     print(f"Error loading audio {audio} for Gemini New SDK: {e}")
+
+            try:
+                # The new SDK expects 'contents'
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=parts
+                )
+                return response.text
+            except Exception as e:
+                return f"Error (new SDK): {e}"
+
+        # Old SDK Implementation
+        else:
+            import google.generativeai as genai_old
+            if audio and flag == "spoken":
+                try:
+                    if os.path.exists(audio):
+                        print(f"Uploading audio {audio} to Gemini (Legacy)...")
+                        audio_file = genai_old.upload_file(path=audio)
+                        parts.append(audio_file)
+                    else:
+                        print(f"Audio file not found: {audio}")
+                except Exception as e:
+                    print(f"Error handling audio: {e}")
+
+            try:
+                response = self.model.generate_content(parts)
+                return response.text
+            except Exception as e:
+                return f"Error (old SDK): {e}"
 
 # -----------------------------------------------------------------------------
 # Qwen-Omni Wrapper (DashScope API or Local)
@@ -258,284 +426,10 @@ class LocalHuggingFaceLLM(BaseLLM):
         return f"Response from {self.model_name} (Simulation): processed {prompt}, img={len(images or [])}, audio={bool(audio)}"
 
 
-class WhisperProcessor(ProcessorMixin):
-    attributes = ["feature_extractor"]
-    feature_extractor_class = "WhisperFeatureExtractor"
-    def __init__(self, feature_extractor):
-        super().__init__(feature_extractor)
-        self.current_processor = self.feature_extractor
-        self._in_target_context_manager = False
-
-    def get_decoder_prompt_ids(self, task=None, language=None, no_timestamps=True):
-        return self.tokenizer.get_decoder_prompt_ids(task=task, language=language, no_timestamps=no_timestamps)
-
-    def get_T_after_cnn(self,L_in, dilation=1):
-        for (padding, kernel_size, stride) in eval("[(1,3,1)] + [(1,3,2)] "):
-            L_out = L_in + 2 * padding - dilation * (kernel_size - 1) - 1
-            L_out = 1 + L_out // stride
-            L_in = L_out
-        return L_out
-
-    def __call__(self, *args, **kwargs):
-        if self._in_target_context_manager:
-            return self.current_processor(*args, **kwargs)
-
-        audio = kwargs.pop("audio", None)
-        sampling_rate = kwargs.pop("sampling_rate", 16000)
-        text = kwargs.pop("text", None)
-        if len(args) > 0:
-            audio = args[0]
-            args = args[1:]
-
-        if audio is None and text is None:
-            raise ValueError("You need to specify either an `audio` or `text` input to process.")
-
-        if audio is not None:
-            L = (audio.shape[0] if audio.shape[0] <= 480000 else 480000)  # max_length < 30s
-            mel_len = L // 160
-            audio_len_after_cnn = self.get_T_after_cnn(mel_len)
-            audio_token_num = (audio_len_after_cnn - 2) // 2 + 1
-            inputs = self.feature_extractor(audio, *args, sampling_rate=sampling_rate, **kwargs)
-            inputs['audio_len_after_cnn'] = torch.tensor(audio_len_after_cnn, dtype=torch.long)
-            inputs['audio_token_num'] = torch.tensor(audio_token_num, dtype=torch.long)
-        if text is not None:
-            encodings = self.tokenizer(text, **kwargs)
-
-        if text is None:
-            return inputs
-
-        elif audio is None:
-            return encodings
-        else:
-            inputs["labels"] = encodings["input_ids"]
-            return inputs
-
-    def batch_decode(self, *args, **kwargs):
-        return self.tokenizer.batch_decode(*args, **kwargs)
-
-    def decode(self, *args, **kwargs):
-        return self.tokenizer.decode(*args, **kwargs)
-
-    def get_prompt_ids(self, text: str, return_tensors="np"):
-        return self.tokenizer.get_prompt_ids(text, return_tensors=return_tensors)
-
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-def build_transform(input_size):
-    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
-    transform = T.Compose([
-        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=MEAN, std=STD)
-    ])
-    return transform
-
-def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
-    best_ratio_diff = float('inf')
-    best_ratio = (1, 1)
-    area = width * height
-    for ratio in target_ratios:
-        target_aspect_ratio = ratio[0] / ratio[1]
-        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
-        if ratio_diff < best_ratio_diff:
-            best_ratio_diff = ratio_diff
-            best_ratio = ratio
-        elif ratio_diff == best_ratio_diff:
-            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
-                best_ratio = ratio
-    return best_ratio
-
-def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
-    orig_width, orig_height = image.size
-    aspect_ratio = orig_width / orig_height
-
-    # calculate the existing image aspect ratio
-    target_ratios = set(
-        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
-        i * j <= max_num and i * j >= min_num)
-    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
-
-    # find the closest aspect ratio to the target
-    target_aspect_ratio = find_closest_aspect_ratio(
-        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
-
-    # calculate the target width and height
-    target_width = image_size * target_aspect_ratio[0]
-    target_height = image_size * target_aspect_ratio[1]
-    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
-
-    # resize the image
-    resized_img = image.resize((target_width, target_height))
-    processed_images = []
-    for i in range(blocks):
-        box = (
-            (i % (target_width // image_size)) * image_size,
-            (i // (target_width // image_size)) * image_size,
-            ((i % (target_width // image_size)) + 1) * image_size,
-            ((i // (target_width // image_size)) + 1) * image_size
-        )
-        # split the image
-        split_img = resized_img.crop(box)
-        processed_images.append(split_img)
-    assert len(processed_images) == blocks
-    if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
-        processed_images.append(thumbnail_img)
-    return processed_images
-
-def load_image(image_file, input_size=448, max_num=12):
-    image = Image.open(image_file).convert('RGB')
-    transform = build_transform(input_size=input_size)
-    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
-    pixel_values = [transform(image) for image in images]
-    pixel_values = torch.stack(pixel_values)
-    return pixel_values
-
-def load_audio(audio_file, audio_processor):
-    audio_values, _ = librosa.load(audio_file, sr=16000) # sample rate should be 16000
-    
-    audio_process_values = audio_processor(audio_values, sampling_rate=16000, return_tensors="pt")
-    input_features = audio_process_values['input_features']
-    audio_len_after_cnn = audio_process_values['audio_len_after_cnn']
-    audio_token_num = audio_process_values['audio_token_num']
-                
-
-    audio_input = {'audio_values': input_features, 
-                   'audio_len_after_cnn': audio_len_after_cnn, 
-                   'audio_token_num': audio_token_num, 
-                   } 
-    return audio_input
 
 
-class InternOmniLLM(LocalHuggingFaceLLM):
-    def __init__(self, model_name: str = "InternOmni"):
-        super().__init__(model_name, hf_path="OpenGVLab/InternOmni")
-        self.image_size = 448
-        self.max_num = 12
 
-    def load_model(self):
-        if self.model is None:
-            print(f"Loading {self.model_name} from {self.hf_path}...")
-            try:
-                # Patch for missing transformers.onnx in newer transformers versions (e.g. 5.0.0)
-                # OpenGVLab/InternOmni remote code depends on it
-                import sys
-                import types
-                try:
-                    import transformers.onnx
-                except ImportError:
-                    print("Patching missing transformers.onnx for InternOmni...")
-                    dummy_onnx = types.ModuleType("transformers.onnx")
-                    
-                    class MockOnnxConfig:
-                        def __init__(self, *args, **kwargs): pass
-                    
-                    class MockOnnxSeq2SeqConfigWithPast:
-                        def __init__(self, *args, **kwargs): pass
-                        
-                    dummy_onnx.OnnxConfig = MockOnnxConfig
-                    dummy_onnx.OnnxSeq2SeqConfigWithPast = MockOnnxSeq2SeqConfigWithPast
-                    
-                    sys.modules["transformers.onnx"] = dummy_onnx
-                    import transformers
-                # Suppress logging to avoid "KeyError: 'architectures'" in InternOmni config __repr__
-                # which is triggered by logger.info(f"Model config {config}") in AutoConfig.from_pretrained
-                # due to a bug in the remote code's config class default initialization
-                transformers.logging.set_verbosity_error()
 
-                import torch
-                from transformers import AutoModel, AutoTokenizer
-                
-                self.tokenizer = AutoTokenizer.from_pretrained(self.hf_path, trust_remote_code=True, use_fast=False)
-                # InternOmni usually requires float16/bfloat16
-                self.model = AutoModel.from_pretrained(
-                    self.hf_path, 
-                    trust_remote_code=True, 
-                    torch_dtype=torch.bfloat16,
-                    low_cpu_mem_usage=True,
-                    device_map="auto"
-                ).eval()
-                
-                # Audio processor
-                self.audio_processor = WhisperProcessor.from_pretrained(self.hf_path)
-                
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(f"Error loading InternOmni: {e}")
-
-    def generate(self, prompt: str, images: Optional[List[str]] = None, audio: Optional[str] = None) -> str:
-        self.load_model()
-        if not self.model:
-            return "Error: Model not loaded."
-
-        try:
-            import torch
-            
-            # Prepare Image
-            pixel_values = None
-            if images and len(images) > 0:
-                # Use load_image helper
-                pixel_values = load_image(images[0], input_size=self.image_size, max_num=self.max_num)
-                pixel_values = pixel_values.to(torch.bfloat16).cuda()
-            
-            # Prepare Audio
-            audio_input = None
-            if audio:
-                # Use load_audio helper
-                audio_input = load_audio(audio, self.audio_processor)
-                # Move tensors to cuda
-                if isinstance(audio_input, dict):
-                    if 'audio_values' in audio_input:
-                        audio_input['audio_values'] = audio_input['audio_values'].to(torch.bfloat16).cuda()
-                    if 'audio_len_after_cnn' in audio_input:
-                        audio_input['audio_len_after_cnn'] = audio_input['audio_len_after_cnn'].to(self.model.device)
-                    if 'audio_token_num' in audio_input:
-                        audio_input['audio_token_num'] = audio_input['audio_token_num'].to(self.model.device)
-
-            generation_config = dict(
-                max_new_tokens=1024,
-                do_sample=True,
-                # temperature=0.7,
-                # top_p=0.95,
-            )
-            
-            # Construct input logic based on available modalities
-            if hasattr(self.model, 'Audio_chat'):
-                 # model.Audio_chat(tokenizer=tokenizer, pixel_values=pixel_values, audio=audio, question=None, generation_config)
-                 # Note: User example passes question=None when audio is present (ASR task).
-                 # But if we want to ask a question about image/audio, we should pass prompt.
-                 # User example: question = '请将这段语音识别成文字...' then passed question=None in the line:
-                 # response = model.Audio_chat(..., question=None, generation_config)
-                 # Wait, user commented out the question line. Maybe for ASR it's None.
-                 # But for general chat, we should pass the prompt.
-                 # Let's pass the prompt.
-                 
-                 response = self.model.Audio_chat(
-                     tokenizer=self.tokenizer, 
-                     pixel_values=pixel_values,
-                     audio=audio_input, 
-                     question=prompt if prompt else None, 
-                     generation_config=generation_config
-                 )
-                 return response
-            else:
-                 return "Error: model.Audio_chat method not found."
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return f"Error: {e}"
-
-class MingOmniLLM(LocalHuggingFaceLLM):
-    def __init__(self, model_name: str = "Ming-Omni"):
-        super().__init__(model_name, hf_path="inclusionAI/Ming-Lite-Omni") # Based on search
-
-class M2OmniLLM(LocalHuggingFaceLLM):
-    def __init__(self, model_name: str = "M2-omni"):
-        super().__init__(model_name, hf_path="M2-omni/M2-omni") # Hypothetical path
 
 class Qwen25OmniLLM(LocalHuggingFaceLLM):
     def __init__(self, model_name: str = "Qwen/Qwen2.5-Omni-7B"):
@@ -717,14 +611,7 @@ def get_model(model_name: str) -> BaseLLM:
              return Qwen25OmniLLM(model_name)
         return QwenOmniLLM(model_name)
     
-    if "intern" in name_lower and "omni" in name_lower:
-        return InternOmniLLM(model_name)
-        
-    if "ming" in name_lower:
-        return MingOmniLLM(model_name)
-        
-    if "m2" in name_lower:
-        return M2OmniLLM(model_name)
+
 
     # Default fallback
     print(f"Warning: Unknown model {model_name}, defaulting to OpenAI.")
@@ -734,52 +621,60 @@ def get_model(model_name: str) -> BaseLLM:
 # Test Block
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Test all models
-    test_models = [
-        # "gpt-4o-mini",
-        # "gemini-2.0-flash-exp",
-        # "Qwen/Qwen2.5-Omni-7B",
-        "InternOmni",
-        "Ming-Omni",
-        "M2-omni"
-    ]
+    # Test cases
+    prompt_text = "Describe what you see in the image."
+    prompt_audio = "output.wav" 
+    prompt_images =["test_view.jpg"] 
     
-    image_url = "https://llava-vl.github.io/static/images/view.jpg"
-    prompt_text = "Please describe the image."
-    
-    # Download image temporarily for testing
-    import requests
-    from PIL import Image
-    from io import BytesIO
-    
-    local_image_path = "test_view.jpg"
-    print(f"Downloading test image from {image_url}...")
-    try:
-        response = requests.get(image_url)
-        if response.status_code == 200:
-            with open(local_image_path, "wb") as f:
-                f.write(response.content)
-            print(f"Saved to {local_image_path}")
-        else:
-            print(f"Failed to download image: {response.status_code}")
-            local_image_path = None
-    except Exception as e:
-        print(f"Error downloading image: {e}")
-        local_image_path = None
+    # Check if files exist
+    if not os.path.exists(prompt_audio):
+        print(f"Creating dummy audio file {prompt_audio}...")
+        # Create a dummy wav file if it doesn't exist
+        import wave
+        with wave.open(prompt_audio, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b'\x00' * 32000) # 2 seconds of silence
+            
+    if not os.path.exists(prompt_images[0]):
+        print(f"Creating dummy image file {prompt_images[0]}...")
+        from PIL import Image
+        img = Image.new('RGB', (100, 100), color = 'red')
+        img.save(prompt_images[0])
 
-    if local_image_path:
-        for model_name in test_models:
-            print(f"\n--- Testing Model: {model_name} ---")
-            try:
-                model = get_model(model_name)
-                # Pass list of images as expected by signature
-                response = model.generate(prompt=prompt_text, images=[local_image_path])
-                print(f"Response:\n{response}")
-            except Exception as e:
-                print(f"Error testing {model_name}: {e}")
+    print(f"Testing with Audio: {prompt_audio} + Image: {prompt_images[0]}")
+    print("-" * 50)
+
+    # Define test configurations: (Name, Model, Flag, UseImages)
+    models_to_test = [
+        # ("OpenAI (Text+Image)", OpenAILLM("gpt-4o"), "text", True),
+        # ("OpenAI (ASR Pipeline)", OpenAILLM("gpt-4o"), "asr", True),
         
-        # Cleanup
-        # if os.path.exists(local_image_path):
-        #    os.remove(local_image_path)
-    else:
-        print("Skipping tests because image could not be downloaded.")
+        ("OpenAI (Text+Image)", OpenAILLM("gpt-4o-mini"), "text", True),
+        ("OpenAI (ASR Pipeline)", OpenAILLM("gpt-4o-mini"), "asr", True),
+        
+        # Gemini 2.0 Flash
+        # ("Gemini 2.0 Flash (Text+Image)", GeminiLLM("gemini-2.0-flash"), "text", True),
+        # ("Gemini 2.0 Flash (Spoken - Image+Audio)", GeminiLLM("gemini-2.0-flash"), "spoken", True),
+        # ("Gemini 2.0 Flash (ASR Pipeline)", GeminiLLM("gemini-2.0-flash"), "asr", True),
+
+        # Gemini 2.5 Flash (Requested)
+        ("Gemini 2.5 Flash (Image+Audio)", GeminiLLM("gemini-2.5-flash"), "spoken", True),
+        ("Gemini 2.5 Flash (Text+Audio)",   GeminiLLM("gemini-2.5-flash"), "spoken", False), # No image
+        ("Gemini 2.5 Flash (ASR+Audio)",    GeminiLLM("gemini-2.5-flash"), "asr", True),    # With image (VQA via ASR)
+
+        # Gemini 2.5 Pro (Requested)
+        ("Gemini 2.5 Pro (Image+Audio)", GeminiLLM("gemini-2.5-pro"), "spoken", True),
+        ("Gemini 2.5 Pro (Text+Audio)",   GeminiLLM("gemini-2.5-pro"), "spoken", False), # No image
+        ("Gemini 2.5 Pro (ASR+Audio)",    GeminiLLM("gemini-2.5-pro"), "asr", True),    # With image (VQA via ASR)
+    ]
+
+    for name, model, flag, use_images in models_to_test:
+        print(f"\n--- Testing: {name} [Flag={flag}] ---")
+        try:
+            current_images = prompt_images if use_images else None
+            response = model.generate(prompt=prompt_text, images=current_images, audio=prompt_audio, flag=flag)
+            print(f"Response:\n{response}")
+        except Exception as e:
+            print(f"Failed: {e}")
